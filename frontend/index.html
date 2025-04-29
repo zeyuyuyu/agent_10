@@ -1,50 +1,111 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>任务上传与处理</title>
+  <meta charset="utf-8">
+  <title>Multi-Agent PDF / Task Runner</title>
+  <style>
+    body            { font-family: system-ui, sans-serif; margin: 2rem; }
+    h1              { margin-top: 0 }
+    textarea        { width: 100%; box-sizing: border-box; }
+    #log            { height: 420px; border: 1px solid #ccc; padding: 8px;
+                      overflow-y: scroll; font-family: ui-monospace, monospace;
+                      background:#fafafa; }
+    #log p          { margin: 4px 0; }
+    pre             { background:#f0f0f0; padding:6px; white-space:pre-wrap;
+                      border-radius: 4px; }
+    button          { padding: 6px 12px; margin-top: 6px; }
+  </style>
 </head>
 <body>
-    <h1>任务上传与处理</h1>
-    
-    <label for="inputText">输入文本：</label>
-    <textarea id="inputText" rows="5" cols="40" placeholder="请输入任务文本"></textarea><br><br>
-    
-    <label for="uploadFile">上传PDF文件：</label>
-    <input type="file" id="uploadFile" accept=".pdf"><br><br>
-    
-    <button onclick="submitTask()">提交任务</button>
+  <h1>Multi-Agent Runner (Stream Demo)</h1>
 
-    <script>
-        function submitTask() {
-            const inputText = document.getElementById('inputText').value;
-            const uploadFile = document.getElementById('uploadFile').files[0];
+  <label>输入文本：</label><br>
+  <textarea id="inputText" rows="4" placeholder="Enter task text…"></textarea><br><br>
 
-            let formData = new FormData();
-            if (inputText) {
-                formData.append('text', inputText);  // 如果有文本，添加文本
-            }
-            if (uploadFile) {
-                formData.append('file', uploadFile);  // 如果有文件，添加文件
-            }
+  <label>上传 PDF：</label>
+  <input type="file" id="pdfFile" accept="application/pdf">
+  <button id="runBtn">开始执行</button>
 
-            // Submit form data to backend
-            fetch('http://localhost:5001/submit_task', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
-                console.log('处理结果:', data);
-                alert('任务已提交，结果为：' + JSON.stringify(data));
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                alert('任务提交失败！');
-            });
+  <h2>实时日志</h2>
+  <div id="log"></div>
+
+  <script>
+  const $ = sel => document.querySelector(sel);
+  function log(html){
+    const box = $('#log');
+    box.insertAdjacentHTML('beforeend', html);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  /** 渲染不同类型事件 **/
+  function render(evt){
+    const d = evt.data;
+    switch(evt.type){
+      case "chat_text":
+        log(`<p style="color:#0a0">💬 ${d.message}</p>`); break;
+
+      case "subtask_list":
+        log(`<p><b>📋 Subtasks:</b> ${
+          d.list.map(o=>`${o.index}. ${o.description}`).join(", ")
+        }</p>`); break;
+
+      case "subtask_start":
+        log(`<p style="color:#1e88e5">▶ Subtask ${d.index} start — ${d.description}</p>`); break;
+
+      case "action_start":
+        log(`<p> └ 🛠 Action ${d.index} on <b>${d.agent_name}</b> start</p>`); break;
+
+      case "action_end":
+        log(`<p> └ ✔ Action ${d.index} ${d.status}</p>${
+          d.result ? `<pre>${d.result}</pre>` : ""}`); break;
+
+      case "subtask_end":
+        log(`<p style="color:#1e88e5">■ Subtask ${d.index} end</p>`); break;
+
+      case "chat_file":
+        log(`<hr><pre>${d.file_data}</pre>`); break;
+
+      /* 若有未知类型，直接打印 */
+      default:
+        log(`<pre>${JSON.stringify(evt,null,2)}</pre>`);
+    }
+  }
+
+  /** 发送表单并消费 SSE **/
+  $('#runBtn').onclick = async ()=>{
+    $('#log').innerHTML = "";          // 清空日志
+    const fd = new FormData();
+    fd.append("text", $('#inputText').value || "");
+    const f = $('#pdfFile').files[0];
+    if (f) fd.append("file", f);
+
+    const resp = await fetch("/submit_task_stream", {
+      method: "POST",
+      body: fd,
+      headers: { "Accept": "text/event-stream" }
+    });
+
+    const reader = resp.body.getReader();
+    const dec    = new TextDecoder();
+    let buffer   = "";
+
+    while (true){
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += dec.decode(value, {stream:true});
+
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1){
+        const chunk = buffer.slice(0, idx).trim();
+        buffer      = buffer.slice(idx + 2);
+        if (chunk.startsWith("data:")){
+          const dataStr = chunk.replace(/^data:\s*/, "");
+          try { render(JSON.parse(dataStr)); } catch(e){ console.error(e); }
         }
-    </script>
+      }
+    }
+  };
+  </script>
 </body>
 </html>
 

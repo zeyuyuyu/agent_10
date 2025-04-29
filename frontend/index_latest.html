@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LLM 调度器实时进度</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2rem auto; }
+  textarea { width: 100%; resize: vertical; }
+  #log { border:1px solid #ccc; padding:1rem; height:320px; overflow-y:auto;
+         white-space:pre-wrap; background:#f9f9f9; }
+</style>
+</head>
+<body>
+  <h2>提交任务（流式）</h2>
+
+  <label>输入文本：</label><br>
+  <textarea id="inputText" rows="4"
+            placeholder="请输入任务文本"></textarea><br><br>
+
+  <label>上传 PDF：</label>
+  <input id="uploadFile" type="file" accept=".pdf"><br><br>
+
+  <button id="runBtn">开始执行</button>
+
+  <h3>实时日志</h3>
+  <div id="log"></div>
+
+<script>
+const logBox = document.getElementById('log');
+const runBtn = document.getElementById('runBtn');
+
+function append(obj) {
+  logBox.textContent += JSON.stringify(obj, null, 2) + '\n\n';
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+runBtn.onclick = async () => {
+  logBox.textContent = '--- 开始任务 ---\n\n';
+
+  const fd = new FormData();
+  fd.append('text', document.getElementById('inputText').value || '');
+  const file = document.getElementById('uploadFile').files[0];
+  if (file) fd.append('file', file);
+
+  const resp = await fetch('/submit_task_stream', {   // 同域即可
+    method: 'POST',
+    body: fd,
+    headers: { Accept: 'text/event-stream' }
+  });
+
+  if (!resp.ok) { append({error:`HTTP ${resp.status}`}); return; }
+
+  const reader  = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer    = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream:true});
+
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      const chunk = buffer.slice(0, idx).trim();
+      buffer      = buffer.slice(idx + 2);
+      if (chunk.startsWith('data:')) {
+        const jsonStr = chunk.replace(/^data:\s*/, '');
+        try { append(JSON.parse(jsonStr)); } catch {}
+      }
+    }
+  }
+};
+</script>
+</body>
+</html>
+

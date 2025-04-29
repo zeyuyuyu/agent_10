@@ -1,27 +1,54 @@
-from fastapi import FastAPI, File, Form, UploadFile
-from typing import Optional
+from pathlib import Path
+import asyncio, json
+from uuid import uuid4
+
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+
 from scheduler.llm_scheduler import LLMScheduler
 
 app = FastAPI()
-scheduler = LLMScheduler()
+app.add_middleware(CORSMiddleware, allow_origins=["*"])
+sch = LLMScheduler()
 
-@app.post("/submit_task")
-async def submit_task(
-    text: str = Form(...),              # 用户任务全文
-    file: Optional[UploadFile] = File(None)  # 可选 PDF
-):
-    pdf_bytes = await file.read() if file else None
+# ---------- 静态前端 ----------
+BASE_DIR      = Path(__file__).resolve().parent.parent
+FRONTEND_DIR  = BASE_DIR / "frontend"
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="frontend")
 
-    # 调度器签名：dispatch(context_id, task, file_bytes=None)
-    result, trace = scheduler.dispatch(
-        context_id="ctx001",
-        task=text,          # ← 改这里
-        file_bytes=pdf_bytes
-    )
+@app.get("/")
+async def index():                    # 关键：根路径直接返回 index.html
+    return FileResponse(FRONTEND_DIR / "index.html")
 
-    return {"memory": result, "trace": trace}
+# ---------- SSE ----------
+@app.post("/submit_task_stream")
+async def submit_task_stream(text: str = Form(""), file: UploadFile | None = None):
 
-if __name__ == "__main__":
+    pdf = await file.read() if file else None
+    q   = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def push(msg): loop.call_soon_threadsafe(q.put_nowait, msg)
+
+    asyncio.create_task(asyncio.to_thread(
+        sch.dispatch, f"ctx_{uuid4().hex}", text,
+        pdf_bytes=pdf, progress_cb=push
+    ))
+
+    async def event_gen():
+        while True:
+            msg = await q.get()
+            yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
+            if msg.get("type") == "chat_file":
+                break
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+if __name__ == "__main__":            # 直接 python coordinator/server.py 也能跑
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run("coordinator.server:app",
+                host="0.0.0.0", port=8080, reload=True)
 

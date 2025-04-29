@@ -1,242 +1,167 @@
-import os
-import io
-import requests
-from typing import List, Dict, Tuple, Optional
-
-import fitz  # PyMuPDF
+import json, textwrap, requests, fitz, uuid                    # ← uuid 用来生成 subtask_id
+from typing import List, Dict, Tuple, Any, Callable, Optional
 from openai import OpenAI
 from mcp.memory import MemoryStore
+import os
 
-try:
-    from pdf2image import convert_from_bytes
-    import pytesseract
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
-
-# ---------- 配置 ----------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-REGISTRY: Dict[str, str] = {
-    "llama2_agent":   "http://136.59.129.136:34517/infer",
-    "llama2_agent_2": "http://142.214.185.187:30934/infer"
+REGISTRY: Dict[str, Dict[str, str]] = {
+    "llama2_agent":   {"url": "http://136.59.129.136:34517/infer",
+                       "desc": "长篇文本解析、逻辑推理"},
+    "llama2_agent_2": {"url": "http://142.214.185.187:30934/infer",
+                       "desc": "OCR、表格/图像抽取"},
 }
 
+def _page_ranges(ids: List[str]) -> List[Tuple[str, str]]:
+    nums = sorted(int(i.split("_")[1]) for i in ids)
+    out, start = [], nums[0]; prev = start
+    for n in nums[1:]:
+        if n == prev + 1: prev = n
+        else: out.append((start, prev)); start = prev = n
+    out.append((start, prev))
+    return [(f"page_{a}", f"page_{b}") for a, b in out]
 
 class LLMScheduler:
-    """
-    三种场景：
-      1. task + PDF（二进制/文件流）→ 按页拆分 → GPT-4o 分页分配
-      2. task + plain_text        → 视为单页 text_1 → 分给首个 agent
-      3. 仅 task 指令            → GPT-4o 拆子任务 → 分配给各 agent
-    """
-
-    def __init__(self):
-        self.memory = MemoryStore()
-        self.trace: List[Dict] = []
-
-    # ---------- PDF → pages ----------
+    def __init__(self): self.mem = MemoryStore()
     @staticmethod
-    def _pdf_pages(data: bytes) -> List[Tuple[str, str]]:
-        pages: List[Tuple[str, str]] = []
-        doc = fitz.open(stream=data, filetype="pdf")
-        for idx, page in enumerate(doc, 1):
-            txt = page.get_text("text") or ""
-            if not txt.strip() and OCR_AVAILABLE:
-                img = convert_from_bytes(
-                    data, dpi=300, first_page=idx, last_page=idx
-                )[0]
-                txt = pytesseract.image_to_string(img, lang="eng+chi_sim")
-            pages.append((f"page_{idx}", txt.strip()))
-        return pages
-
-    # ---------- GPT-4o 页面分配 ----------
-    def _plan_pages(
-        self, task: str, page_ids: List[str]
-    ) -> Dict[str, List[str]]:
-        ids_str = ", ".join(page_ids)
-        sys_msg = (
-            "你是任务调度专家，根据【任务】将页面分配给下列 agent："
-            + ", ".join(REGISTRY.keys())
-            + "。格式：agent: id1,id2 或 agent: m-n。仅返回分配结果。"
-        )
-        user_msg = f"【任务】{task}\n【页面列表】{ids_str}"
-        rsp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-            ],
-        )
-        return self._parse_page_plan(rsp.choices[0].message.content)
-
-    # ---------- GPT-4o 子任务分配 ----------
-    def _plan_subtasks(self, task: str) -> Dict[str, List[str]]:
-        sys_msg = (
-            "你是任务调度专家，请把【任务】拆分为多个可并行子任务，并分配给 agent："
-            + ", ".join(REGISTRY.keys())
-            + "。输出每行：agent: 子任务描述。仅返回结果。"
-        )
-        rsp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": task},
-            ],
-        )
-        mapping: Dict[str, List[str]] = {k: [] for k in REGISTRY}
-        for line in rsp.choices[0].message.content.splitlines():
-            if ":" not in line:
-                continue
-            ag, desc = line.split(":", 1)
-            ag = ag.strip()
-            if ag in REGISTRY:
-                mapping[ag].append(desc.strip())
-        return {k: v for k, v in mapping.items() if v}
-
-    # ---------- 解析页面 plan ----------
+    def _push(cb,p): cb and cb(p)
     @staticmethod
-    def _parse_page_plan(text: str) -> Dict[str, List[str]]:
-        plan = {k: [] for k in REGISTRY}
-        for ln in text.splitlines():
-            if ":" not in ln:
-                continue
-            ag, ids = ln.split(":", 1)
-            ag = ag.strip()
-            if ag not in REGISTRY:
-                continue
-            ids = ids.replace(" ", "")
-            for part in ids.split(","):
-                if not part:
-                    continue
-                if "-" in part:
-                    s, e = part.split("-")
-                    s_idx = int("".join(filter(str.isdigit, s)))
-                    e_idx = int("".join(filter(str.isdigit, e)))
-                    prefix = "".join(filter(str.isalpha, s)) or "page_"
-                    plan[ag] += [
-                        f"{prefix}{i}" for i in range(s_idx, e_idx + 1)
-                    ]
-                else:
-                    plan[ag].append(part)
-        return {k: v for k, v in plan.items() if v}
+    def _pdf_pages(data): return [(f"page_{i+1}",p.get_text("text"))
+                                  for i,p in enumerate(fitz.open(stream=data,filetype="pdf"))]
 
-    # ---------- dispatch ----------
-    def dispatch(
-        self,
-        context_id: str,
-        task: str,
-        pdf_bytes: Optional[bytes] = None,
-        file_bytes: Optional[bytes] = None,
-        plain_text: Optional[str] = None,
-    ):
-        # ① 判断输入类型
-        pdf_data = pdf_bytes or file_bytes
+    def _call_agent(self, ag: str, payload: Dict[str,Any]):
+        """MCP：始终发送 JSON，其中至少包含 subtask_id 与 prompt"""
+        try:
+            r = requests.post(REGISTRY[ag]["url"], json=payload, timeout=180)
+            res = r.json() if r.status_code == 200 else {}
+            return ("succeed", res.get("result", "")) if "result" in res \
+                   else ("failed", str(res)[:120])
+        except Exception as e:
+            return "failed", f"[❌]{e}"
 
-        if pdf_data:
-            # —— PDF 路径 ——
-            pages = self._pdf_pages(pdf_data)
-            page_map = dict(pages)
-            plan = self._plan_pages(task, [pid for pid, _ in pages])
+    # ---------- GPT 规划 ----------（保持原样） ---------------------------
+    def _plan_pdf(self,task,pages):
+        summary_lines=[]
+        for pid,txt in pages:
+            clean=txt.replace("\n"," ")
+            summary_lines.append(f"{pid}: {textwrap.shorten(clean,120)}")
+        system="根据 agent 能力分配页面，返回 JSON {agent:[page_id,…]}。\n"+ \
+               "\n".join(f"{k}: {v['desc']}" for k,v in REGISTRY.items())
+        rsp=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"system","content":system},
+                      {"role":"user","content":"任务:"+task+"\n页面:\n"+"\n".join(summary_lines)}],
+            response_format={"type":"json_object"})
+        try: data=json.loads(rsp.choices[0].message.content)
+        except: data={}
+        return {k:v for k,v in data.items() if k in REGISTRY and isinstance(v,list)}
 
-            # GPT 分配失败时，平均轮转给 agent
+    def _need_split(self,task):
+        rsp=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"system","content":"仅回答 yes/no"},
+                      {"role":"user","content":task}],max_tokens=1)
+        return rsp.choices[0].message.content.strip().lower().startswith("y")
+
+    def _plan_text(self,task):
+        sys="拆分任务并分配 agent，返回 JSON {agent:[子任务,…]}。\n"+ \
+            "\n".join(f"{k}: {v['desc']}" for k,v in REGISTRY.items())
+        rsp=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"system","content":sys},
+                      {"role":"user","content":task}],
+            response_format={"type":"json_object"})
+        try: data=json.loads(rsp.choices[0].message.content)
+        except: data={}
+        return {k:v for k,v in data.items() if k in REGISTRY and isinstance(v,list)}
+
+    # ---------- dispatch ---------- ---------------------------------------
+    def dispatch(self,ctx,task,*,pdf_bytes=None,
+                 progress_cb:Callable[[Dict[str,Any]],None]|None=None):
+
+        self._push(progress_cb,{"type":"chat_text",
+                                "data":{"message":"已接收任务，开始规划…"}})
+
+        subtasks=[]; page_dict={}
+
+        # ---- PDF ----
+        if pdf_bytes:
+            pages=self._pdf_pages(pdf_bytes); page_dict=dict(pages)
+            plan=self._plan_pdf(task,pages) or {}
             if not plan:
-                plan = {ag: [] for ag in REGISTRY}
-                for idx, (pid, _) in enumerate(pages):
-                    ag = list(REGISTRY.keys())[idx % len(REGISTRY)]
-                    plan[ag].append(pid)
-
-            make_prompt = lambda pid: (
-                f"【任务指令】{task}\n\n"
-                f"【{pid} 原文】\n{page_map.get(pid, '')}"
-            )
-            sub_ids_source = plan
-
-        elif plain_text is not None:
-            # —— 单段文本 ——
-            pages = [("text_1", plain_text.strip())]
-            plan = {list(REGISTRY.keys())[0]: ["text_1"]}
-            make_prompt = (
-                lambda _:
-                f"【任务指令】{task}\n\n【文本内容】\n{plain_text.strip()}"
-            )
-            sub_ids_source = plan
-
+                half=len(pages)//2 or 1
+                plan={"llama2_agent":[p for p,_ in pages[:half]],
+                      "llama2_agent_2":[p for p,_ in pages[half:]]}
+            idx=1
+            for ag,ids in plan.items():
+                for p1,p2 in _page_ranges(ids):
+                    subtasks.append({
+                        "index": idx,
+                        "subtask_id": uuid.uuid4().hex,          # ← 唯一 subtask_id
+                        "description": "Process "+(p1 if p1==p2 else f"{p1}~{p2}"),
+                        "agent": ag,
+                        "pages": (p1,p2)
+                    })
+                    idx+=1
+        # ---- TEXT ----
         else:
-            # —— 仅指令，拆子任务 ——
-            pages = []
-            plan = self._plan_subtasks(task)
-            make_prompt = (
-                lambda sub:
-                f"【总任务】{task}\n\n【子任务描述】{sub}"
-            )
-            sub_ids_source = plan
+            if not self._need_split(task):
+                subtasks=[{
+                    "index": 1,
+                    "subtask_id": uuid.uuid4().hex,
+                    "description": task,
+                    "agent": next(iter(REGISTRY))
+                }]
+            else:
+                plan=self._plan_text(task); idx=1
+                for ag,lst in plan.items():
+                    for s in lst:
+                        subtasks.append({
+                            "index": idx,
+                            "subtask_id": uuid.uuid4().hex,
+                            "description": s,
+                            "agent": ag
+                        }); idx+=1
 
-        # ② 分发
-        for ag, keys in sub_ids_source.items():
-            for key in keys:
-                prompt_text = make_prompt(key)
-                payload = {
-                    "prompt": prompt_text,
-                    "context_id": context_id,
-                    "sub_id": key,
-                    "agent_name": ag,
-                    "shared_memory": self.memory.get(context_id),
-                }
-                try:
-                    resp = requests.post(
-                        REGISTRY[ag], json=payload, timeout=120
-                    )
-                    res_text = resp.json().get("result", "")
-                except Exception as e:
-                    self.trace.append(
-                        {
-                            "agent": ag,
-                            "subtask": key,
-                            "output": f"[❌ 调用失败] {e}",
-                        }
-                    )
-                    continue
+        self._push(progress_cb,{"type":"subtask_list",
+                                "data":{"list":[{"index":s["index"],
+                                                 "description":s["description"]}
+                                                 for s in subtasks]}})
 
-                # —— 累积写入 memory —— #
-                ag_mem = self.memory.get(context_id).get(ag, {})
-                if not isinstance(ag_mem, dict):
-                    ag_mem = {}
-                ag_mem[key] = res_text
-                self.memory.update(context_id, {ag: ag_mem})
-                # —— End —— #
+        # ---- execute subtasks ----
+        for st in subtasks:
+            self._push(progress_cb,{"type":"subtask_start","data":st})
+            self._push(progress_cb,{"type":"action_start",
+                                    "data":{"subtask_index":st["index"],
+                                            "index":1,
+                                            "agent_name":st["agent"],
+                                            "description":st["description"]}})
 
-                self.trace.append(
-                    {"agent": ag, "subtask": key, "output": res_text}
-                )
+            if pdf_bytes:
+                p1,p2=st["pages"]
+                s=int(p1.split("_")[1]); e=int(p2.split("_")[1])
+                prompt="【任务】"+task+"\n\n" + "\n\n".join(
+                    page_dict[f"page_{i}"] for i in range(s,e+1))
+            else:
+                prompt="【任务】"+task+"\n\n【子任务】"+st["description"]
 
-        # ③ 汇总
-        collected = "\n\n".join(
-            f"【{ag}】\n" + "\n".join(mem.values())
-            for ag, mem in self.memory.get(context_id).items()
-            if ag in REGISTRY
-        )
+            # 发送符合 MCP 的载荷：带 subtask_id
+            payload = {"subtask_id": st["subtask_id"], "prompt": prompt}
 
-        rsp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "请综合以下各智能体输出，总结共识、差异并提出建议：\n"
-                        + collected
-                    ),
-                }
-            ],
-        )
-        summary = rsp.choices[0].message.content.strip()
-        self.memory.update(context_id, {"summary": summary})
-        self.trace.append(
-            {
-                "agent": "scheduler",
-                "subtask": "自动总结",
-                "output": summary,
-            }
-        )
-        return self.memory.get(context_id), self.trace
+            status,result=self._call_agent(st["agent"], payload)
+
+            self._push(progress_cb,{"type":"action_end",
+                                    "data":{"subtask_index":st["index"],
+                                            "index":1,
+                                            "agent_name":st["agent"],
+                                            "status":status,
+                                            "result_format":"markdown",
+                                            "result":result}})
+            self._push(progress_cb,{"type":"subtask_end",
+                                    "data":{"index":st["index"]}})
+
+        self._push(progress_cb,{"type":"chat_file",
+                                "data":{"format":"markdown",
+                                        "file_data":"# 任务全部完成 ✅"}})
 

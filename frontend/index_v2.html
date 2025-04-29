@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>任务上传与处理</title>
+</head>
+<body>
+    <h1>任务上传与处理</h1>
+    
+    <label for="inputText">输入文本：</label>
+    <textarea id="inputText" rows="5" cols="40" placeholder="请输入任务文本"></textarea><br><br>
+    
+    <label for="uploadFile">上传PDF文件：</label>
+    <input type="file" id="uploadFile" accept=".pdf"><br><br>
+    
+    <button onclick="submitTask()">提交任务</button>
+
+    <script>
+        function submitTask() {
+            const inputText = document.getElementById('inputText').value;
+            const uploadFile = document.getElementById('uploadFile').files[0];
+
+            let formData = new FormData();
+            if (inputText) {
+                formData.append('text', inputText);  // 如果有文本，添加文本
+            }
+            if (uploadFile) {
+                formData.append('file', uploadFile);  // 如果有文件，添加文件
+            }
+
+            // Submit form data to backend
+            fetch('http://localhost:5001/submit_task', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('处理结果:', data);
+                alert('任务已提交，结果为：' + JSON.stringify(data));
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('任务提交失败！');
+            });
+        }
+    </script>
+</body>
+</html>
+
