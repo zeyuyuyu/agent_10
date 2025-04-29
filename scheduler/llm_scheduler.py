@@ -1,19 +1,4 @@
-"""
-llm_scheduler.py – 调度中心（2025-05-02 final）
 
-本版汇总此前所有修复，并做两点关键改动：
-
-1️⃣ _plan_text() 的 system prompt 说明：  
-   “**若无需调用任何 agent，而 GPT 自身即可回答，请返回空对象 {}。**”
-
-2️⃣ dispatch() 调度顺序：  
-   - ✅ 先调用 _plan_text() 让 GPT 决定是否需要 agent  
-   - ✅ 若 _plan_text() 返回 {} → 直接 GPT 回复（不生成 subtask）  
-   - ✅ 若有 plan → 按原逻辑生成子任务、调用 agent  
-      （PDF 流程及其它逻辑均保持不变）
-
-*备注：其余代码与上一版一致，仅确保 SyntaxError 已修正。*
-"""
 
 import json, textwrap, requests, uuid, fitz, os, time
 from typing import List, Dict, Tuple, Any, Callable
